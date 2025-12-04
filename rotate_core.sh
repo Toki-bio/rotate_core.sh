@@ -1,11 +1,7 @@
 #!/bin/bash
-# rotate_core.sh - v13 FINAL - Core-based rotation using ssearch36
-#
-# Rotates satellite DNA sequences to align at conserved core region
-# Uses ssearch36 to find best alignment, handles both strands
-#
-# Usage: rotate_core.sh <input.fa> <anchor_name>
-# Output: <input>.rotated.fa
+# rotate_core.sh - v15 - FIXED rotation logic
+# Fixed: correct rotation using (ss - 1 + ANCHOR_OFFSET) % LEN
+# No longer uses incorrect (ss - qs) formula
 
 set -uo pipefail
 
@@ -14,7 +10,8 @@ set -uo pipefail
 INFA="$1"
 ANCHOR_NAME="$2"
 OUTFA="${INFA%.fa}.rotated.fa"
-[[ "$OUTFA" == "$INFA" ]] && OUTFA="${INFA}.rotated"
+[[ "$OUTFA" == "$INFA" ]] && OUTFA="${INFA}.rotated.fa"
+OUTAL="${OUTFA%.fa}.al"
 
 command -v ssearch36 >/dev/null || { echo "Error: ssearch36 not found"; exit 1; }
 command -v seqkit >/dev/null || { echo "Error: seqkit not found"; exit 1; }
@@ -22,17 +19,17 @@ command -v seqkit >/dev/null || { echo "Error: seqkit not found"; exit 1; }
 TMPDIR=$(mktemp -d)
 trap 'rm -rf "$TMPDIR" 2>/dev/null || true' EXIT
 
-echo "=== rotate_core.sh v13 ==="
+echo "=== rotate_core.sh v15 ==="
 echo "Input  : $INFA"
 echo "Anchor : $ANCHOR_NAME"
 echo "Output : $OUTFA"
 echo
 
-# --- Preprocessing ---
+# --- Clean input ---
 tr -d '\r' < "$INFA" | sed '/^$/d' > "$TMPDIR/in.fa"
 seqkit seq -g -w 0 "$TMPDIR/in.fa" > "$TMPDIR/clean.fa"
 
-# --- Extract anchor ---
+# --- Extract anchor sequence ---
 ANCHOR_SEQ=$(awk -v name="$ANCHOR_NAME" '
     /^>/ { hdr=substr($0,2); split(hdr,a," "); current=a[1]; next }
     current == name { print; exit }
@@ -48,14 +45,18 @@ TOTAL=$(grep -c "^>" "$TMPDIR/clean.fa")
 echo "Sequences: $TOTAL"
 echo
 
-# --- Create sequence list (critical: file-based to avoid subshell issues) ---
-awk '/^>/ { 
-    if (seq != "") print name "\t" seq
-    name = substr($0, 2); split(name, a, " "); name = a[1]; seq = ""
+# --- Build sequence list: shortname \t fullheader \t sequence ---
+awk 'BEGIN {OFS="\t"}
+/^>/ { 
+    if (seq != "") print short, full, seq
+    full = substr($0, 2)
+    split(full, a, " ")
+    short = a[1]
+    seq = ""
     next
 }
 { seq = seq $0 }
-END { if (seq != "") print name "\t" seq }
+END { if (seq != "") print short, full, seq }
 ' "$TMPDIR/clean.fa" > "$TMPDIR/seqlist.tsv"
 
 # --- PASS 1: Align anchor vs doubled sequences ---
@@ -64,11 +65,11 @@ echo "=== PASS 1: Aligning ==="
 > "$TMPDIR/hits.tsv"
 SEQ_NUM=0
 
-while IFS=$'\t' read -r NAME SEQ; do
+while IFS=$'\t' read -r SHORTNAME FULLHDR SEQ; do
     SEQ_NUM=$((SEQ_NUM + 1))
     LEN=${#SEQ}
     
-    [[ "$NAME" == "$ANCHOR_NAME" ]] && { echo "[$SEQ_NUM/$TOTAL] $NAME -> anchor"; continue; }
+    [[ "$SHORTNAME" == "$ANCHOR_NAME" ]] && { echo "[$SEQ_NUM/$TOTAL] $SHORTNAME -> anchor"; continue; }
     
     printf ">d\n%s%s\n" "$SEQ" "$SEQ" > "$TMPDIR/dbl.fa"
     
@@ -80,11 +81,11 @@ while IFS=$'\t' read -r NAME SEQ; do
         read -r _ _ _ _ _ _ qs qe ss se _ score _ < "$TMPDIR/best.tmp" || true
         strand="+"; (( qs > qe )) && strand="-"
         printf "%d\t%s\t%d\t%d\t%d\t%d\t%d\t%s\t%s\n" \
-            "$SEQ_NUM" "$NAME" "$LEN" "$qs" "$qe" "$ss" "$se" "$strand" "$score" >> "$TMPDIR/hits.tsv"
-        echo "[$SEQ_NUM/$TOTAL] $NAME -> $strand $score"
+            "$SEQ_NUM" "$SHORTNAME" "$LEN" "$qs" "$qe" "$ss" "$se" "$strand" "$score" >> "$TMPDIR/hits.tsv"
+        echo "[$SEQ_NUM/$TOTAL] $SHORTNAME -> $strand $score"
     else
-        printf "%d\t%s\t%d\t0\t0\t0\t0\t?\t0\n" "$SEQ_NUM" "$NAME" "$LEN" >> "$TMPDIR/hits.tsv"
-        echo "[$SEQ_NUM/$TOTAL] $NAME -> no hit"
+        printf "%d\t%s\t%d\t0\t0\t0\t0\t?\t0\n" "$SEQ_NUM" "$SHORTNAME" "$LEN" >> "$TMPDIR/hits.tsv"
+        echo "[$SEQ_NUM/$TOTAL] $SHORTNAME -> no hit"
     fi
 done < "$TMPDIR/seqlist.tsv"
 
@@ -122,16 +123,16 @@ echo
 echo "=== PASS 3: Rotating ==="
 
 SEQ_NUM=0
-while IFS=$'\t' read -r NAME SEQ; do
+while IFS=$'\t' read -r SHORTNAME FULLHDR SEQ; do
     SEQ_NUM=$((SEQ_NUM + 1))
     LEN=${#SEQ}
     
-    [[ "$NAME" == "$ANCHOR_NAME" ]] && continue
+    [[ "$SHORTNAME" == "$ANCHOR_NAME" ]] && continue
     
     HIT=$(awk -F'\t' -v n="$SEQ_NUM" '$1 == n {print; exit}' "$TMPDIR/hits.tsv") || true
     
     if [[ -z "$HIT" ]]; then
-        printf ">%s\n%s\n" "$NAME" "$SEQ" >> "$OUTFA"
+        printf ">%s\n%s\n" "$FULLHDR" "$SEQ" >> "$OUTFA"
         continue
     fi
     
@@ -142,30 +143,59 @@ while IFS=$'\t' read -r NAME SEQ; do
     strand=$(echo "$HIT" | cut -f8)
     
     if [[ "$strand" == "?" || -z "$strand" ]]; then
-        printf ">%s\n%s\n" "$NAME" "$SEQ" >> "$OUTFA"
+        printf ">%s\n%s\n" "$FULLHDR" "$SEQ" >> "$OUTFA"
         continue
     fi
     
     if [[ "$strand" == "-" ]]; then
         SEQ_USE=$(printf ">_\n%s\n" "$SEQ" | seqkit seq -rp -t dna 2>/dev/null | seqkit seq -s -w 0 2>/dev/null) || {
-            printf ">%s\n%s\n" "$NAME" "$SEQ" >> "$OUTFA"; continue
+            printf ">%s\n%s\n" "$FULLHDR" "$SEQ" >> "$OUTFA"; continue
         }
-        pos=$(( (se - 1) % LEN ))
-        start=$(( LEN - 1 - pos + ANCHOR_OFFSET ))
+        # FIXED: use (se - 1 + ANCHOR_OFFSET) % LEN
+        start=$(( (se - 1 + ANCHOR_OFFSET) % LEN ))
     else
         SEQ_USE="$SEQ"
-        start=$(( ss - qs + ANCHOR_OFFSET ))
+        # FIXED: use (ss - 1 + ANCHOR_OFFSET) % LEN
+        start=$(( (ss - 1 + ANCHOR_OFFSET) % LEN ))
     fi
     
     while (( start < 0 )); do start=$((start + LEN)); done
     start=$((start % LEN))
     
     ROTATED="${SEQ_USE:$start}${SEQ_USE:0:$start}"
-    printf ">%s\n%s\n" "$NAME" "$ROTATED" >> "$OUTFA"
+    printf ">%s\n%s\n" "$FULLHDR" "$ROTATED" >> "$OUTFA"
     
 done < "$TMPDIR/seqlist.tsv"
 
+# --- PASS 4: MAFFT alignment ---
+if command -v mafft >/dev/null; then
+    echo
+    echo "=== PASS 4: MAFFT alignment ==="
+    mafft --thread $(nproc) --threadtb $(nproc) --threadit $(nproc) \
+        --localpair --maxiterate 1000 --ep 0.123 \
+        --nuc --reorder --preservecase --quiet "$OUTFA" > "$TMPDIR/mafft.al"
+
+    # Restore full headers (MAFFT truncates at first space)
+    awk '/^>/{print substr($0,2)}' "$OUTFA" | while read -r hdr; do
+        short=$(echo "$hdr" | cut -d' ' -f1)
+        printf "%s\t%s\n" "$short" "$hdr"
+    done > "$TMPDIR/hdr_map.tsv"
+
+    awk -F'\t' 'NR==FNR {map[$1]=$2; next} 
+        /^>/ {
+            short=substr($0,2)
+            if (short in map) print ">"map[short]
+            else print
+            next
+        }
+        {print}
+    ' "$TMPDIR/hdr_map.tsv" "$TMPDIR/mafft.al" > "$OUTAL"
+    
+    echo "Aligned: $OUTAL"
+else
+    echo "mafft not found - skipping alignment"
+fi
+
 echo
 echo "=== Done ==="
-echo "Output: $OUTFA ($(grep -c '^>' "$OUTFA") sequences)"
-echo "Next: mafft --localpair --maxiterate 1000 $OUTFA > ${OUTFA%.fa}.al"
+echo "Rotated: $OUTFA ($(grep -c '^>' "$OUTFA") sequences)"
